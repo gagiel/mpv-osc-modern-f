@@ -94,10 +94,15 @@ local osc_param = { -- calculated by osc_init()
     areas = {},
 }
 
+-- Convert color from hex
+local function osc_color_convert(color)
+    return color:sub(6,7) .. color:sub(4,5) ..  color:sub(2,3)
+end
+
 local osc_styles = {
     TransBg = '{\\blur100\\bord140\\1c&H000000&\\3c&H000000&}',
     SeekbarBg = '{\\blur0\\bord0\\1c&HFFFFFF&}',
-    SeekbarFg = '{\\blur1\\bord1\\1c&H' .. user_opts.seekbarfg_color .. '&}',
+    SeekbarFg = '{\\blur1\\bord1\\1c&H' .. osc_color_convert(user_opts.seekbarfg_color) .. '&}',
     VolumebarBg = '{\\blur0\\bord0\\1c&H999999&}',
     VolumebarFg = '{\\blur1\\bord1\\1c&HFFFFFF&}',
     Ctrl1 = '{\\blur0\\bord0\\1c&HFFFFFF&\\3c&HFFFFFF&\\fs36\\fnmaterial-design-iconic-font}',
