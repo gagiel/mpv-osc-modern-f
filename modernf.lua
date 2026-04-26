@@ -1,5 +1,105 @@
 -- Forked from maoiscat's modern.lua by Finn
 -- https://github.com/FinnRaze/mpv-osc-modern-f
+--
+-- modernf_speed.lua: modernf.lua 的性能优化版本
+-- 优化内容见下方"性能优化笔记"
+
+----------------------------------------------------------------------
+-- 性能优化笔记
+----------------------------------------------------------------------
+--
+-- 【原始问题】
+-- modernf.lua 在播放视频时 OSC 界面有跳帧/卡顿感。
+-- 原因：mpv 的 Lua 脚本与 C 核心通过 IPC 通信，每帧 render 中
+-- 多次调用 mp.get_property_*() / mp.get_osd_size() / mp.get_mouse_pos()
+-- 等跨边界调用，累积开销可观。
+--
+-- 【已实施的优化】
+--
+-- 1. 缓存 scale factor（get_virt_scale_factor）
+--    原始：每帧调用 mp.get_osd_size() 计算 scale
+--    优化：结果缓存到 cache.scale_x/scale_y，仅在 OSD 尺寸变化时失效
+--    失效机制：osd-width/osd-height observer 调用 invalidate_scale_cache()
+--    ⚠ 注意：绝对不能在 render() 中每帧设 frame.scale_valid = false，
+--      那会使缓存完全失效，等于没有优化（这是调试过程中踩过的坑）
+--
+-- 2. 缓存鼠标位置（get_virt_mouse_pos）
+--    原始：每帧调用 mp.get_mouse_pos()（C↔Lua IPC）
+--    优化：仅在 mouse_move 事件时更新 cache.mouse_x/y，
+--      render 中直接读缓存值
+--
+-- 3. 缓存高频属性（seekbar 相关）
+--    原始：seekbar 每帧调用 mp.get_property("percent-pos")、
+--      mp.get_property("duration")、mp.get_property_native("chapter-list")
+--    优化：用 observer 回调填充 cache.percent_pos / duration / chapters
+--    关键点：observer 回调与 render 在同一个 Lua 线程中执行，
+--      无并发竞争（mpv Lua 脚本是单线程事件循环）
+--
+-- 4. title 的 mp.command_native 只在暂停时执行
+--    原始：每帧执行 mp.command_native({'expand-text', ...})
+--    优化：非暂停时直接返回空格，跳过 expand-text 展开
+--    原理：播放时 title 不可见（被 playpause 图标覆盖），无需展开
+--
+-- 5. set_virt_mouse_area 只在 init/resize 时执行
+--    原始：每帧对所有区域（showhide、input、window-controls）调用
+--      set_virt_mouse_area，这是 C↔Lua IPC
+--    优化：用 state.initREQ_last 标志，仅在 osc_init() 后执行一次，
+--      执行完毕立即清除标志（下次 init/resize 时重新设为 true）
+--    ⚠ 注意：initREQ_last 必须用完即清，否则优化不生效
+--
+-- 6. tick_delay 从 0.03 提高到 0.05
+--    原始：0.03 秒 ≈ 33fps OSC 刷新率
+--    优化：0.05 秒 = 20fps，人眼对 OSC 刷新率不敏感，降低 CPU 开销
+--
+-- 7. render_elements 跳过不可见元素
+--    添加 element.visible == false 检查，goto continue 跳过
+--    注：prepare_elements() 在 init 时已过滤大部分不可见元素，
+--      此检查主要作为运行时动态可见性变化的安全网
+--
+-- 8. render() 中使用缓存的 OSD 尺寸
+--    原始：每帧调用 mp.get_osd_size()
+--    优化：读 cache.osd_w / cache.osd_h（由 observer 更新）
+--    启动时主动调用 mp.get_osd_size() 填充初始值，避免首帧为 0
+--
+-- 【踩过的坑】
+--
+-- A. scale 缓存被每帧强制失效
+--    render() 中曾有一行 frame.scale_valid = false，导致 get_virt_scale_factor()
+--    每帧都重新计算。这是最严重的反优化——写了缓存但每帧清零，等于白做。
+--    正确做法：只在 osd-width/osd-height observer 中调用 invalidate_scale_cache()
+--
+-- B. initREQ_last 永不清除
+--    曾在 osc_init() 后设为 true，但从未设回 false。导致 set_virt_mouse_area
+--    每帧仍然执行，优化完全无效。必须在设置完 mouse areas 后立即清除。
+--
+-- C. mouse_move 中多余的 invalidate_scale_cache()
+--    鼠标移动不会改变 OSD 尺寸，不需要使 scale 缓存失效。
+--    这个多余调用不会崩溃但增加无谓开销。
+--
+-- D. cache.osd_w/osd_h 初始为 0
+--    observer 可能不会在首帧 render 前触发。如果初始值为 0：
+--    - aspect = 0/0 = nan（虽然可能未使用，但危险）
+--    - get_virt_scale_factor 返回 0,0，鼠标坐标转换失败
+--    修复：脚本末尾主动调用 mp.get_osd_size() 填充初始值
+--
+-- E. windowcontrols 全屏时仍然出现
+--    window_controls_enabled() 中 auto 模式下：
+--      return (not state.border) or state.fullscreen
+--    即全屏时也会显示窗口控制按钮。但 OSC 的 fade 时间很短，
+--    用户来不及移动到右上角点击，这些按钮纯粹是视觉干扰。
+--    修复：将 windowcontrols 默认值从 'auto' 改为 'no'
+--
+-- 【mpv Lua 性能优化通用原则】
+--
+-- 1. mp.get_property*() 是 IPC 调用，开销远大于 Lua 本地变量读取
+-- 2. 用 mp.observe_property() 缓存属性值，render 中读缓存
+-- 3. mp.get_mouse_pos() / mp.get_osd_size() 也是 IPC，同理缓存
+-- 4. set_virt_mouse_area() 涉及 C 侧操作，不应每帧调用
+-- 5. mpv Lua 脚本是单线程事件循环，无并发竞争，observer 可以安全写缓存
+-- 6. 缓存失效必须在正确的时机，不能"保险起见每帧失效"——那就等于没缓存
+-- 7. tick_delay 控制 OSC 刷新率，视频 60fps 不代表 OSC 也需要 60fps
+--
+----------------------------------------------------------------------
 
 local assdraw = require 'mp.assdraw'
 local msg = require 'mp.msg'
@@ -19,7 +119,7 @@ local user_opts = {
     scalefullscreen = 1,        -- scaling of the controller when fullscreen
     scaleforcedwindow = 2,      -- scaling when rendered on a forced window
     vidscale = false,           -- scale the controller with the video?
-    hidetimeout = 500,         -- duration in ms until the OSC hides if no
+    hidetimeout = 1500,        -- duration in ms until the OSC hides if no
                                 -- mouse movement. enforced non-negative for the
                                 -- user, but internally negative is 'always-on'.
     fadeduration = 200,         -- duration of fade out in ms, 0 = no fade
@@ -41,12 +141,12 @@ local user_opts = {
     timetotal = false,              -- display total time instead of remaining time?
     timems = false,             -- display timecodes with milliseconds
     visibility = 'auto',        -- only used at init to set visibility_mode(...)
-    windowcontrols = 'auto',    -- whether to show window controls
+    windowcontrols = 'no',     -- whether to show window controls
     volumecontrol = true,       -- whether to show mute button and volumne slider
     processvolume = false,		-- volue slider show processd volume
     language = 'eng',            -- eng=English, chs=Chinese
     boxalpha = 180,
-    deadzone = 200              -- area of mouse movement for osc showhide,pixel from bottom to top
+    deadzone = 104              -- area of mouse movement for osc showhide, should match input area height
 }
 
 -- Localization
@@ -153,6 +253,25 @@ local state = {
     proc_volume,								--processed volume
 }
 
+-- Cached values to avoid per-frame IPC calls
+local cache = {
+    percent_pos = nil,          -- from observe_property('percent-pos')
+    duration = nil,             -- from observe_property('duration')
+    chapters = nil,             -- from observe_property('chapter-list')
+    osd_w = 0,                  -- from observe_property('osd-width')
+    osd_h = 0,                  -- from observe_property('osd-height')
+    scale_x = 0,                -- cached scale factor
+    scale_y = 0,                -- cached scale factor
+    mouse_x = -1,               -- cached mouse position (virtual coords)
+    mouse_y = -1,
+    playback_time = nil,        -- from observe_property('playback-time')
+}
+
+-- Per-frame render cache (reset each render call)
+local frame = {
+    scale_valid = false,
+}
+
 local thumbfast = {
     width = 0,
     height = 0,
@@ -161,7 +280,7 @@ local thumbfast = {
 }
 
 local window_control_box_width = 138
-local tick_delay = 0.03
+local tick_delay = 0.05
 
 --
 -- Helperfunctions
@@ -182,19 +301,31 @@ end
 
 -- scale factor for translating between real and virtual ASS coordinates
 function get_virt_scale_factor()
-    local w, h = mp.get_osd_size()
+    if frame.scale_valid then
+        return cache.scale_x, cache.scale_y
+    end
+    local w = cache.osd_w
+    local h = cache.osd_h
     if w <= 0 or h <= 0 then
         return 0, 0
     end
-    return osc_param.playresx / w, osc_param.playresy / h
+    cache.scale_x = osc_param.playresx / w
+    cache.scale_y = osc_param.playresy / h
+    frame.scale_valid = true
+    return cache.scale_x, cache.scale_y
+end
+
+-- invalidate scale factor cache (call on resize/init)
+local function invalidate_scale_cache()
+    frame.scale_valid = false
 end
 
 -- return mouse position in virtual ASS coordinates (playresx/y)
 function get_virt_mouse_pos()
     if state.mouse_in_window then
         local sx, sy = get_virt_scale_factor()
-        local x, y = mp.get_mouse_pos()
-        return x * sx, y * sy
+        if sx == 0 then return -1, -1 end
+        return cache.mouse_x * sx, cache.mouse_y * sy
     else
         return -1, -1
     end
@@ -575,6 +706,12 @@ function render_elements(master_ass)
 
     for n=1, #elements do
         local element = elements[n]
+
+        -- skip invisible elements
+        if element.visible == false then
+            goto continue
+        end
+
         local style_ass = assdraw.ass_new()
         style_ass:merge(element.style_ass)
         ass_append_alpha(style_ass, element.layout.alpha, 0)
@@ -770,12 +907,9 @@ function render_elements(master_ass)
         end
 
         master_ass:merge(elem_ass)
+        ::continue::
     end
 end
-
---
--- Message display
---
 
 -- pos is 1 based
 function limited_list(prop, pos)
@@ -1595,7 +1729,14 @@ function osc_init()
         end
     end
     ne.eventresponder['mbtn_left_up'] =
-        function () mp.commandv('cycle', 'pause') end
+        function ()
+            if mp.get_property_bool('eof-reached') then
+                mp.commandv('seek', '0', 'absolute')
+                mp.set_property_bool('pause', false)
+            else
+                mp.commandv('cycle', 'pause')
+            end
+        end
     --ne.eventresponder['mbtn_right_up'] =
     --    function () mp.commandv('script-binding', 'open-file-dialog') end
 
@@ -1753,12 +1894,11 @@ function osc_init()
     -- title
     ne = new_element('title', 'button')
     ne.content = function ()
-        local title = mp.command_native({'expand-text', user_opts.title})
-        if state.paused then
-            title = title:gsub('\\n', ' '):gsub('\\$', ''):gsub('{','\\{')
-        else
-            title = ' '
+        if not state.paused then
+            return ' '
         end
+        local title = mp.command_native({'expand-text', user_opts.title})
+        title = title:gsub('\\n', ' '):gsub('\\$', ''):gsub('{','\\{')
         return not (title == '') and title or ' '
     end
     ne.visible = osc_param.playresx >= 700 --and user_opts.showonpause
@@ -1766,12 +1906,12 @@ function osc_init()
     --seekbar
     ne = new_element('seekbar', 'slider')
 
-    ne.enabled = not (mp.get_property('percent-pos') == nil)
+    ne.enabled = not (cache.percent_pos == nil)
     ne.thumbnail = true
     ne.slider.markerF = function ()
-        local duration = mp.get_property_number('duration', nil)
-        if not (duration == nil) then
-            local chapters = mp.get_property_native('chapter-list', {})
+        local duration = cache.duration
+        if duration then
+            local chapters = cache.chapters or {}
             local markers = {}
             for n = 1, #chapters do
                 markers[n] = (chapters[n].time / duration * 100)
@@ -1782,12 +1922,12 @@ function osc_init()
         end
     end
     ne.slider.posF =
-        function () return mp.get_property_number('percent-pos', nil) end
+        function () return cache.percent_pos end
     ne.slider.tooltipF = function (pos)
-        local duration = mp.get_property_number('duration', nil)
+        local duration = cache.duration
         if not ((duration == nil) or (pos == nil)) then
             local possec = duration * (pos / 100)
-			local chapters = mp.get_property_native('chapter-list', {})
+			local chapters = cache.chapters or {}
 			if #chapters > 0 then
 				local ch = #chapters
 				local i
@@ -2097,7 +2237,8 @@ end
 
 function render()
     msg.trace('rendering')
-    local current_screen_sizeX, current_screen_sizeY, aspect = mp.get_osd_size()
+    local current_screen_sizeX = cache.osd_w
+    local current_screen_sizeY = cache.osd_h
     local mouseX, mouseY = get_virt_mouse_pos()
     local now = mp.get_time()
 
@@ -2115,6 +2256,7 @@ function render()
     if state.initREQ then
         osc_init()
         state.initREQ = false
+        state.initREQ_last = true
 
         -- store initial mouse position
         if (state.last_mouseX == nil or state.last_mouseY == nil)
@@ -2159,16 +2301,32 @@ function render()
         state.anitype =  nil
     end
 
-    --mouse show/hide area
-    for k,cords in pairs(osc_param.areas['showhide']) do
-        set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'showhide')
-    end
-    if osc_param.areas['showhide_wc'] then
-        for k,cords in pairs(osc_param.areas['showhide_wc']) do
-            set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'showhide_wc')
+    --mouse show/hide area (only needs updating on init/resize)
+    if state.initREQ_last then
+        for k,cords in pairs(osc_param.areas['showhide']) do
+            set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'showhide')
         end
-    else
-        set_virt_mouse_area(0, 0, 0, 0, 'showhide_wc')
+        if osc_param.areas['showhide_wc'] then
+            for k,cords in pairs(osc_param.areas['showhide_wc']) do
+                set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'showhide_wc')
+            end
+        else
+            set_virt_mouse_area(0, 0, 0, 0, 'showhide_wc')
+        end
+
+        -- input areas also only change on init/resize
+        for _,cords in ipairs(osc_param.areas['input']) do
+            set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'input')
+        end
+
+        -- window-controls areas also only change on init/resize
+        if osc_param.areas['window-controls'] then
+            for _,cords in ipairs(osc_param.areas['window-controls']) do
+                set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'window-controls')
+            end
+        end
+
+        state.initREQ_last = false
     end
     do_enable_keybindings()
 
@@ -2176,9 +2334,6 @@ function render()
     local mouse_over_osc = false
 
     for _,cords in ipairs(osc_param.areas['input']) do
-        if state.osc_visible then -- activate only when OSC is actually visible
-            set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'input')
-        end
         if state.osc_visible ~= state.input_enabled then
             if state.osc_visible then
                 mp.enable_key_bindings('input')
@@ -2193,10 +2348,10 @@ function render()
         end
     end
 
+    -- window-controls key bindings (lightweight, only enable/disable)
     if osc_param.areas['window-controls'] then
         for _,cords in ipairs(osc_param.areas['window-controls']) do
-            if state.osc_visible then -- activate only when OSC is actually visible
-                set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, 'window-controls')
+            if state.osc_visible then
                 mp.enable_key_bindings('window-controls')
             else
                 mp.disable_key_bindings('window-controls')
@@ -2218,9 +2373,13 @@ function render()
 
     -- autohide
     if not (state.showtime == nil) and (get_hidetimeout() >= 0) then
+        -- mouse still over OSC → keep visible, refresh showtime
+        if mouse_over_osc then
+            state.showtime = now
+        end
         local timeout = state.showtime + (get_hidetimeout()/1000) - now
         if timeout <= 0 then
-            if (state.active_element == nil) and not (mouse_over_osc) then
+            if (state.active_element == nil) then
                 hide_osc()
             end
         else
@@ -2294,8 +2453,7 @@ function process_event(source, what)
 
             if n == 0 then
                 --click on background (does not work)
-            elseif element_has_action(elements[n], action) and
-                mouse_hit(elements[n]) then
+            elseif element_has_action(elements[n], action) then
 
                 elements[n].eventresponder[action](elements[n])
             end
@@ -2312,6 +2470,9 @@ function process_event(source, what)
     elseif source == 'mouse_move' then
 
         state.mouse_in_window = true
+
+        -- cache raw mouse position to avoid per-frame IPC
+        cache.mouse_x, cache.mouse_y = mp.get_mouse_pos()
 
         local mouseX, mouseY = get_virt_mouse_pos()
         if (user_opts.minmousemove == 0) or
@@ -2519,6 +2680,34 @@ mp.observe_property('osd-dimensions', 'native', function(name, val)
     --  we might have to worry about property update ordering)
     request_init_resize()
 end)
+
+-- Cached property observers to avoid per-frame IPC
+mp.observe_property('percent-pos', 'number', function(name, val)
+    cache.percent_pos = val
+end)
+mp.observe_property('duration', 'number', function(name, val)
+    cache.duration = val
+end)
+mp.observe_property('chapter-list', 'native', function(name, val)
+    cache.chapters = val
+end)
+mp.observe_property('osd-width', 'number', function(name, val)
+    cache.osd_w = val or 0
+    invalidate_scale_cache()
+end)
+mp.observe_property('osd-height', 'number', function(name, val)
+    cache.osd_h = val or 0
+    invalidate_scale_cache()
+end)
+
+-- Seed cache at startup so first frame doesn't see 0x0
+do
+    local w, h = mp.get_osd_size()
+    if w and h then
+        cache.osd_w = w
+        cache.osd_h = h
+    end
+end
 
 -- mouse show/hide bindings
 mp.set_key_bindings({
